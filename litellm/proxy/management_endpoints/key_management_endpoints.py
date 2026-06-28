@@ -1868,6 +1868,15 @@ def is_different_team(data: UpdateKeyRequest, existing_key_row: LiteLLM_Verifica
     return data.team_id != existing_key_row.team_id
 
 
+def _get_effective_team_id_for_key_mutation(
+    data: Union[UpdateKeyRequest, RegenerateKeyRequest],
+    existing_key_row: LiteLLM_VerificationToken,
+) -> Optional[str]:
+    if "team_id" in data.model_fields_set:
+        return data.team_id
+    return getattr(existing_key_row, "team_id", None)
+
+
 def _validate_max_budget(max_budget: Optional[float]) -> None:
     """
     Validate that max_budget is not negative.
@@ -2083,10 +2092,13 @@ async def _validate_mcp_servers_for_key_update(
 ) -> Optional[ObjectPermissionDict]:
     """Validate MCP servers in object_permission against the effective team."""
     effective_team_obj = team_obj
-    # If team_id isn't being changed, resolve the existing key's team
-    if effective_team_obj is None and existing_key_row.team_id:
+    effective_team_id = _get_effective_team_id_for_key_mutation(
+        data=data,
+        existing_key_row=existing_key_row,
+    )
+    if effective_team_obj is None and effective_team_id is not None:
         effective_team_obj = await get_team_object(
-            team_id=existing_key_row.team_id,
+            team_id=effective_team_id,
             prisma_client=prisma_client,
             user_api_key_cache=user_api_key_cache,
             check_db_only=True,
@@ -2222,7 +2234,10 @@ async def _validate_update_key_data(
 
     # Check team limits if key has a team_id (from request or existing key)
     team_obj: Optional[LiteLLM_TeamTableCachedObj] = None
-    _team_id_to_check = data.team_id or getattr(existing_key_row, "team_id", None)
+    _team_id_to_check = _get_effective_team_id_for_key_mutation(
+        data=data,
+        existing_key_row=existing_key_row,
+    )
     if _team_id_to_check is not None:
         team_obj = await get_team_object(
             team_id=_team_id_to_check,
@@ -4480,9 +4495,13 @@ async def regenerate_key_fn(
 
         if data is not None and (data.access_group_ids or data.object_permission is not None):
             regenerate_team_table: Optional[LiteLLM_TeamTableCachedObj] = None
-            if _key_in_db.team_id is not None:
+            regenerate_team_id = _get_effective_team_id_for_key_mutation(
+                data=data,
+                existing_key_row=_key_in_db,
+            )
+            if regenerate_team_id is not None:
                 regenerate_team_table = await get_team_object(
-                    team_id=_key_in_db.team_id,
+                    team_id=regenerate_team_id,
                     prisma_client=prisma_client,
                     user_api_key_cache=user_api_key_cache,
                     check_db_only=True,

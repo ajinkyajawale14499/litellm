@@ -18,6 +18,7 @@ from fastapi import HTTPException
 from litellm.proxy._types import (
     GenerateKeyRequest,
     LiteLLM_BudgetTable,
+    LiteLLM_ObjectPermissionBase,
     LiteLLM_OrganizationTable,
     LiteLLM_TeamTableCachedObj,
     LiteLLM_UserTable,
@@ -25,6 +26,7 @@ from litellm.proxy._types import (
     LitellmUserRoles,
     Member,
     ProxyException,
+    RegenerateKeyRequest,
     ResetSpendRequest,
     UpdateKeyRequest,
 )
@@ -715,6 +717,165 @@ async def test_update_key_personal_non_admin_denied_access_groups(
         )
     assert exc.value.status_code == 403
     assert "Access groups" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "data,expected_detail",
+    [
+        (
+            UpdateKeyRequest(
+                key="sk-team-key",
+                team_id=None,
+                access_group_ids=["ag-private"],
+            ),
+            "Access groups cannot be assigned to personal keys",
+        ),
+        (
+            UpdateKeyRequest(
+                key="sk-team-key",
+                team_id=None,
+                object_permission=LiteLLM_ObjectPermissionBase(
+                    vector_stores=["vs-private"],
+                ),
+            ),
+            "Vector stores cannot be assigned to personal keys",
+        ),
+    ],
+)
+async def test_update_key_detach_team_uses_personal_gates(
+    monkeypatch,
+    data,
+    expected_detail,
+):
+    mock_prisma_client = AsyncMock()
+    mock_prisma_client.get_data = AsyncMock(return_value=[])
+    team_id = "team-1"
+    user_id = "alice"
+    team_table = LiteLLM_TeamTableCachedObj(
+        team_id=team_id,
+        members_with_roles=[Member(user_id=user_id, role="user")],
+        team_member_permissions=["/key/update", "/key/access_group_assignment"],
+    )
+
+    async def mock_get_team_object(*args, **kwargs):
+        return team_table
+
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.get_team_object",
+        mock_get_team_object,
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.management_helpers.team_member_permission_checks.get_team_object",
+        mock_get_team_object,
+    )
+
+    existing_key_row = MagicMock(
+        token="hashed_team_key",
+        user_id=user_id,
+        team_id=team_id,
+        created_by=user_id,
+        max_budget=None,
+        organization_id=None,
+        project_id=None,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await _validate_update_key_data(
+            data=data,
+            existing_key_row=existing_key_row,
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.INTERNAL_USER,
+                api_key="sk-alice",
+                user_id=user_id,
+            ),
+            llm_router=None,
+            premium_user=True,
+            prisma_client=mock_prisma_client,
+            user_api_key_cache=MagicMock(),
+        )
+
+    assert exc.value.status_code == 403
+    assert expected_detail in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_regenerate_key_detach_team_uses_personal_access_group_gate(
+    monkeypatch,
+):
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        regenerate_key_fn,
+    )
+
+    team_id = "team-1"
+    user_id = "alice"
+    token = "hashed_team_key"
+    team_table = LiteLLM_TeamTableCachedObj(
+        team_id=team_id,
+        members_with_roles=[Member(user_id=user_id, role="user")],
+        team_member_permissions=["/key/regenerate", "/key/access_group_assignment"],
+    )
+    key_in_db = MagicMock(
+        token=token,
+        user_id=user_id,
+        team_id=team_id,
+        created_by=user_id,
+        max_budget=None,
+        key_alias=None,
+        organization_id=None,
+        project_id=None,
+    )
+    mock_prisma_client = AsyncMock()
+    mock_prisma_client.db = MagicMock()
+    mock_prisma_client.db.litellm_verificationtoken = MagicMock()
+    mock_prisma_client.db.litellm_verificationtoken.find_unique = AsyncMock(
+        return_value=key_in_db
+    )
+
+    async def mock_get_team_object(*args, **kwargs):
+        return team_table
+
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.get_team_object",
+        mock_get_team_object,
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.management_helpers.team_member_permission_checks.get_team_object",
+        mock_get_team_object,
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.master_key", None)
+    monkeypatch.setattr("litellm.proxy.proxy_server.premium_user", True)
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints._persist_deleted_verification_tokens",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints._execute_virtual_key_regeneration",
+        AsyncMock(return_value=MagicMock()),
+    )
+
+    with pytest.raises((HTTPException, ProxyException)) as exc:
+        await regenerate_key_fn(
+            data=RegenerateKeyRequest(
+                key=token,
+                team_id=None,
+                access_group_ids=["ag-private"],
+            ),
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.INTERNAL_USER,
+                api_key="sk-alice",
+                user_id=user_id,
+            ),
+            litellm_changed_by=None,
+        )
+
+    assert int(getattr(exc.value, "status_code", None) or exc.value.code) == 403
+    assert "Access groups cannot be assigned to personal keys" in str(
+        getattr(exc.value, "detail", None) or exc.value.message
+    )
 
 
 @pytest.mark.asyncio
